@@ -1,0 +1,22 @@
+= nrepl-ssh-transport
+
+Clojure library to add SSH transport for nRepl - secure, transparent repl auth and authz
+
+
+Some commands to help test / explore
+
+    # List tcp connections in LISTEN
+    netstat -ntl -p tcp
+
+    # Connect to the server
+    ssh localhost -p 2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no
+    # Run command on server
+    ssh localhost -p 2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no echo "hello"
+
+== Resources
+
+* https://github.com/atthorst/sshd-mina-example
+* https://mina.apache.org/sshd-project/
+* https://www.youtube.com/watch?v=TXYNitj2VW8
+* https://github.com/keathmilligan/sshdtest
+* https://keathmilligan.net/embedding-apache-mina-sshd

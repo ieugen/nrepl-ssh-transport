@@ -1,15 +1,18 @@
 (ns ro.ieugen.nrepl-ssh
   (:import [org.apache.sshd.server SshServer]
            [org.apache.sshd.server.shell ProcessShellFactory]
+           [org.apache.sshd.server.command CommandFactory AbstractCommandSupport Command]
            [org.apache.sshd.server.keyprovider SimpleGeneratorHostKeyProvider]
            [org.apache.sshd.server.auth.password PasswordAuthenticator]
            [org.apache.sshd.server.shell InteractiveProcessShellFactory]
-           [org.apache.sshd.common AttributeRepository]
+           [org.apache.sshd.common AttributeRepository SshConstants]
            [org.apache.sshd.common.io IoConnector IoServiceEventListener]
            [org.apache.sshd.common.session SessionListener]
-           [java.net SocketAddress]))
+           [org.apache.sshd.common.util.threads SshThreadPoolExecutor ThreadUtils]
+           [java.net SocketAddress]
+           [java.nio.charset StandardCharsets]))
 
-(def server-instance (atom nil))
+(defonce ssh-server (atom nil))
 
 (defn dumb-authenticator []
   (reify PasswordAuthenticator
@@ -60,22 +63,41 @@
 
 (comment
 
-  (let [ssh-server (SshServer/setUpDefaultServer)]
-    (doto ssh-server
+  (defn repl-command [channel cmd]
+    (let [executor-service (ThreadUtils/newFixedThreadPool "nrepl-sshd-pool" 4)]
+      (proxy [AbstractCommandSupport] [cmd executor-service]
+        (run
+          ([] (let [out (.getOutputStream this)
+                    c (str "Run command " cmd "\n")]
+                (println c)
+                (doto out
+                  (.write (.getBytes c StandardCharsets/UTF_8))
+                  (.flush))
+                (.onExit this 0)))))))
+
+  (defn nrepl-command-factory []
+    (reify org.apache.sshd.server.command.CommandFactory
+      (createCommand [this channel command]
+        (println "Create command " command)
+        (repl-command channel command))))
+
+  (let [instance (SshServer/setUpDefaultServer)]
+    (reset! ssh-server instance)
+    (doto instance
       (.setHost "127.0.0.1")
       (.setPort 2222)
       (.setKeyPairProvider (SimpleGeneratorHostKeyProvider.))
       (.setPasswordAuthenticator (dumb-authenticator))
-      (.setShellFactory InteractiveProcessShellFactory/INSTANCE)
+      ;; (.setShellFactory InteractiveProcessShellFactory/INSTANCE)
+      (.setCommandFactory (nrepl-command-factory))
       (.setIoServiceEventListener (io-service-event-listener))
       (.addSessionListener (logging-session-listener))
       (.start))
-    (swap! server-instance (fn [o-s n-s] (when-not (nil? o-s) (.stop o-s)) n-s) ssh-server)
-    (java.lang.Thread/sleep java.lang.Long/MAX_VALUE))
+    ;; (java.lang.Thread/sleep java.lang.Long/MAX_VALUE)
+    )
 
-  (.stop @server-instance)
+  (println "test")
 
+  (.stop @ssh-server)
 
   0)
-
-
