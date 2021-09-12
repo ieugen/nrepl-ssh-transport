@@ -15,8 +15,9 @@ Some commands to help test / explore
 
 == Resources
 
-* https://github.com/atthorst/sshd-mina-example
+* https://github.com/apache/mina-sshd
 * https://mina.apache.org/sshd-project/
+* https://github.com/atthorst/sshd-mina-example
 * https://www.youtube.com/watch?v=TXYNitj2VW8
 * https://github.com/keathmilligan/sshdtest
 * https://keathmilligan.net/embedding-apache-mina-sshd

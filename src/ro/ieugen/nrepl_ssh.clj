@@ -1,23 +1,26 @@
 (ns ro.ieugen.nrepl-ssh
-  (:import [org.apache.sshd.server SshServer]
-           [org.apache.sshd.server.shell ProcessShellFactory]
-           [org.apache.sshd.server.command CommandFactory AbstractCommandSupport Command]
-           [org.apache.sshd.server.keyprovider SimpleGeneratorHostKeyProvider]
-           [org.apache.sshd.server.auth.password PasswordAuthenticator]
-           [org.apache.sshd.server.shell InteractiveProcessShellFactory]
-           [org.apache.sshd.common AttributeRepository SshConstants]
-           [org.apache.sshd.common.io IoConnector IoServiceEventListener]
+  (:require [taoensso.timbre :as timbre
+             :refer [debug info error trace]])
+  (:import [java.time Duration]
+           [org.apache.sshd.client SshClient]
+           [org.apache.sshd.client.auth.password PasswordIdentityProvider]
+           [org.apache.sshd.client.session ClientSession]
+           [org.apache.sshd.common.io IoServiceEventListener]
            [org.apache.sshd.common.session SessionListener]
-           [org.apache.sshd.common.util.threads SshThreadPoolExecutor ThreadUtils]
-           [java.net SocketAddress]
-           [java.nio.charset StandardCharsets]))
+           [org.apache.sshd.common.util GenericUtils]
+           [org.apache.sshd.common.util.threads ThreadUtils]
+           [org.apache.sshd.server SshServer]
+           [org.apache.sshd.server.auth.password PasswordAuthenticator]
+           [org.apache.sshd.server.command CommandFactory Command]
+           [org.apache.sshd.server.keyprovider SimpleGeneratorHostKeyProvider]))
 
 (defonce ssh-server (atom nil))
+(defonce ssh-client (atom nil))
 
 (defn dumb-authenticator []
   (reify PasswordAuthenticator
     (authenticate [this username password session]
-      (println "Auth request " username " " password "  " session)
+      (debug "Auth request " username " " password "  " session)
       true)))
 
 (defn io-service-event-listener []
@@ -27,77 +30,157 @@
                             local
                             ctx
                             remote]
-      (println "Connection established"))
+      (debug "Connection established"))
     (abortEstablishedConnection [this
                                  connector
                                  local
                                  ctx
                                  remote
                                  throwableble]
-      (println "Connection aborted" throwableble))
+      (debug throwableble "Connection aborted" connector " " local " " ctx " " remote))
     (connectionAccepted [this acceptor local remote service]
-      (println "Connection accepted"))
+      (debug "Connection accepted" acceptor " " local " " remote " " service))
     (abortAcceptedConnection [this acceptor local remote service throwableble]
-      (println "Abort accepted connection " throwableble))))
+      (debug throwableble "Abort accepted connection " acceptor " " local " " remote " " service))))
 
 (defn logging-session-listener []
   (reify SessionListener
     (sessionEstablished [this session]
-      (println "Session established"))
+      (debug "Session established" session))
     (sessionCreated [this session]
-      (println "Session created"))
+      (debug "Session created" session))
     (sessionPeerIdentificationSend [this session line extra-lines]
-      (println "Session peer ident send " line extra-lines))
+      (debug "Session peer ident send " session " " line " " extra-lines))
     (sessionPeerIdentificationLine [this session line extra-lines]
-      (println "Session peer ident line " line extra-lines))
+      (debug "Session peer ident line " session " " line " " extra-lines))
     (sessionPeerIdentificationReceived [this session version extra-lines]
-      (println "Session peer ident received " version extra-lines))
+      (debug "Session peer ident received " session " " version " " extra-lines))
     (sessionEvent [this session event]
-      (println "Session event " event))
+      (debug "Session event " session " " event))
     (sessionException [this session throwable]
-      (println "Session exception " throwable))
+      (debug throwable "Session exception " session))
     (sessionDisconnect [this session reason msg language initiator]
-      (println "Session disconnect " reason msg))
+      (debug "Session disconnect " session " " reason " " msg " " language " " initiator))
     (sessionClosed [this session]
-      (println "Session closed"))))
+      (debug "Session closed" session))))
 
-(comment
+(defn- pool-prefix
+  [^String cmd]
+  (if (GenericUtils/isEmpty cmd) "repl-command" (-> cmd
+                                                    (.replace " " "_")
+                                                    (.replace "/" ":"))))
 
-  (defn repl-command [channel cmd]
-    (let [executor-service (ThreadUtils/newFixedThreadPool "nrepl-sshd-pool" 4)]
-      (proxy [AbstractCommandSupport] [cmd executor-service]
-        (run
-          ([] (let [out (.getOutputStream this)
-                    c (str "Run command " cmd "\n")]
-                (println c)
-                (doto out
-                  (.write (.getBytes c StandardCharsets/UTF_8))
-                  (.flush))
-                (.onExit this 0)))))))
+(defn- pool-name
+  [^String cmd]
+  (str (pool-prefix cmd) "-" (Math/abs (bit-and (System/nanoTime) 0xFFFFFF))))
 
-  (defn nrepl-command-factory []
-    (reify org.apache.sshd.server.command.CommandFactory
-      (createCommand [this channel command]
-        (println "Create command " command)
-        (repl-command channel command))))
+(defn repl-command
+  "Implements ^Command interface.
+   Mina SSHD will receive create a ^Command for each command executed by user."
+  [channel cmd]
+  (let [executors (ThreadUtils/newSingleThreadExecutor (pool-name cmd))
+        state (atom {:cmd cmd
+                     :channel channel})]
+    (reify
+      Command
+      (setInputStream [this in]
+        (trace "setInputStream(" channel ")")
+        (swap! state assoc :in in))
+      (setOutputStream [this out]
+        (trace "setOutputStream(" channel ")")
+        (swap! state assoc :out out))
+      (setErrorStream [this err]
+        (trace "setErrorStream(" channel ")")
+        (swap! state assoc :err err))
+      (setExitCallback [this callback]
+        (trace "setExitCallback(" channel ")")
+        (swap! state assoc :callback callback))
+      (start [this channel env]
+        (swap! state assoc :env env)
+        (try
+          (debug "start(" channel ") starting runner for command="  cmd)
+          (let [future (.submit executors this)]
+            (swap! state assoc :cmd-future future))
+          (catch RuntimeException e
+            (error e "start(" channel ") Failed (repl-command) to start command " cmd ": "))))
 
-  (let [instance (SshServer/setUpDefaultServer)]
-    (reset! ssh-server instance)
-    (doto instance
+      (destroy [this channel]
+        (debug "destroy(" channel ") ?")
+        (let [cmd-future (:cmd-future @state)
+              should-cancel (and cmd-future
+                                 ;; TODO: check current thread ?!
+                                 (not (.isDone cmd-future)))]
+          (when should-cancel
+            (let [result (.cancel cmd-future true)]
+              (debug "destroy(" channel ")[" this "] - cancel pending future=" result)))
+          (swap! state :cmd-future nil)
+          (when-not (.isShutdown executors)
+            (let [runners (.shutdownNow executors)
+                  size (.size runners)]
+              (debug "destroy(" channel ")[" this "] - shutdown executors service - runners count=" size)))))
+
+      Runnable
+      (run [this]
+           (let [callback (:callback @state)]
+             (debug "Running command " (CommandFactory/split cmd))
+             (.onExit callback 0))))))
+
+(defn command-factory []
+  (reify org.apache.sshd.server.command.CommandFactory
+    (createCommand [this channel command]
+      (debug "Create command " channel " " command)
+      (repl-command channel command))))
+
+(defn nrepl-ssh-server []
+  (let [ssh-server (SshServer/setUpDefaultServer)]
+    (doto ssh-server
       (.setHost "127.0.0.1")
       (.setPort 2222)
       (.setKeyPairProvider (SimpleGeneratorHostKeyProvider.))
       (.setPasswordAuthenticator (dumb-authenticator))
-      ;; (.setShellFactory InteractiveProcessShellFactory/INSTANCE)
-      (.setCommandFactory (nrepl-command-factory))
+      ;; (.setShellFactory (shell-factory))
+      (.setCommandFactory (command-factory))
       (.setIoServiceEventListener (io-service-event-listener))
       (.addSessionListener (logging-session-listener))
       (.start))
-    ;; (java.lang.Thread/sleep java.lang.Long/MAX_VALUE)
-    )
+    ssh-server))
 
-  (println "test")
+(comment
+
+
+  (defn nrepl-ssh-client []
+    (let [^SshClient ssh-client (SshClient/setUpDefaultClient)]
+      (doto ssh-client
+        (.setPasswordIdentityProvider PasswordIdentityProvider/EMPTY_PASSWORDS_PROVIDER)
+        (.start)))
+    ssh-client)
+
+  (defn send [client]
+    (with-open [^ClientSession session (-> client
+                                           (.connect "ieugen" "127.0.0.1" 2222)
+                                           (.verify (Duration/ofMinutes 2))
+                                           (.getSession))]
+      (doto session
+        (.addPasswordIdentity "empty")
+        (-> (.auth)
+            (.verify (Duration/ofMinutes 2))))))
+
+  (reset! ssh-server (nrepl-ssh-server))
+
+  (reset! ssh-client (nrepl-ssh-client))
+
+  (send @ssh-client)
+
+  (.stop @ssh-client)
 
   (.stop @ssh-server)
+
+
+  (let [cmd "hello my little / friend"]
+    (-> cmd
+        (.replace " " "_")
+        (.replace "/" ":")))
+
+  (Math/abs (bit-and (System/nanoTime) 0xFFFFFF))
 
   0)
