@@ -1,7 +1,10 @@
 (ns ro.ieugen.nrepl-ssh
   (:require [taoensso.timbre :as timbre
-             :refer [debug info error trace]])
-  (:import [java.time Duration]
+             :refer [debug info error trace warn]]
+            [clojure.java.io :as io])
+  (:import [java.io IOException InterruptedIOException]
+           [java.nio.charset StandardCharsets]
+           [java.time Duration]
            [org.apache.sshd.client SshClient]
            [org.apache.sshd.client.auth.password PasswordIdentityProvider]
            [org.apache.sshd.client.session ClientSession]
@@ -12,7 +15,8 @@
            [org.apache.sshd.server SshServer]
            [org.apache.sshd.server.auth.password PasswordAuthenticator]
            [org.apache.sshd.server.command CommandFactory Command]
-           [org.apache.sshd.server.keyprovider SimpleGeneratorHostKeyProvider]))
+           [org.apache.sshd.server.keyprovider SimpleGeneratorHostKeyProvider]
+           [org.apache.sshd.server.shell ShellFactory]))
 
 (defonce ssh-server (atom nil))
 (defonce ssh-client (atom nil))
@@ -74,6 +78,55 @@
   [^String cmd]
   (str (pool-prefix cmd) "-" (Math/abs (bit-and (System/nanoTime) 0xFFFFFF))))
 
+
+(defn my-run
+  [cmd in out err exit-callback handle-cmd-line]
+  (try
+    (if (nil? cmd)
+      (let [rdr (io/reader in :encoding "utf8")]
+        (info "Another command ?" cmd)
+        (loop [cmd (.readLine rdr)]
+          (if (or
+               (nil? cmd)
+               (not (handle-cmd-line cmd)))
+            nil
+            (recur (.readLine rdr)))))
+      (do
+        (info "Command " cmd)
+        (handle-cmd-line cmd)))
+    (catch InterruptedIOException e
+      (debug e "InterruptedIOException " cmd)
+      nil)
+    (catch Exception e
+        ;; handle exception during commmand execution
+      (let [message (str "Failed (repl-cmd) to handle " cmd (.getMessage e))]
+        (try
+          (let [bytes (-> message (.getBytes StandardCharsets/US_ASCII))]
+            (.write err bytes))
+          (catch IOException ioe
+            (warn "Failed (" (-> e (.getClass) (.getSimpleName))
+                  ") to write error message=" message (.getMessage ioe)))
+          (finally
+              ;; signal command was executed with error
+            (debug "Done with " cmd " => " message)
+            (.onExit exit-callback -1 message)))))
+    (finally
+      ;; signal command was executed successfully
+      (debug "Done with cmd " cmd)
+      (.onExit exit-callback 0 ""))))
+
+(defn echo-cmd-line-handler
+  [out cmd]
+  (info "Echo" cmd)
+  (let [cmd-nl (str cmd \newline)
+        bytes (.getBytes cmd-nl StandardCharsets/UTF_8)
+        res (not= "exit" cmd)]
+    (debug "Send" cmd "and " res)
+    (doto out
+      (.write bytes)
+      (.flush))
+    res))
+
 (defn repl-command
   "Implements ^Command interface.
    Mina SSHD will receive create a ^Command for each command executed by user."
@@ -121,15 +174,21 @@
 
       Runnable
       (run [this]
-           (let [callback (:callback @state)]
+           (let [{:keys [callback in out err]} @state
+                 handle-cmd-line (partial echo-cmd-line-handler out)]
              (debug "Running command " (CommandFactory/split cmd))
-             (.onExit callback 0))))))
+             (my-run cmd in out err callback handle-cmd-line))))))
 
 (defn command-factory []
-  (reify org.apache.sshd.server.command.CommandFactory
+  (reify CommandFactory
     (createCommand [this channel command]
       (debug "Create command " channel " " command)
       (repl-command channel command))))
+
+(defn echo-shell-factory []
+  (reify ShellFactory
+    (createShell [shis channel]
+      (repl-command channel nil))))
 
 (defn nrepl-ssh-server []
   (let [ssh-server (SshServer/setUpDefaultServer)]
@@ -138,7 +197,7 @@
       (.setPort 2222)
       (.setKeyPairProvider (SimpleGeneratorHostKeyProvider.))
       (.setPasswordAuthenticator (dumb-authenticator))
-      ;; (.setShellFactory (shell-factory))
+      (.setShellFactory (echo-shell-factory))
       (.setCommandFactory (command-factory))
       (.setIoServiceEventListener (io-service-event-listener))
       (.addSessionListener (logging-session-listener))
@@ -182,5 +241,7 @@
         (.replace "/" ":")))
 
   (Math/abs (bit-and (System/nanoTime) 0xFFFFFF))
+
+  (str "aa" \newline)
 
   0)
